@@ -3,8 +3,8 @@ const logger = require('./logger'); // Assuming a logger is available
 
 const RABBIT_URL = process.env.RABBIT_URL || 'amqp://localhost';
 const EXCHANGE_NAME = process.env.EXCHANGE_NAME || 'my_exchange';
-const QUEUE_NAME = 'SimpleQueue';
-const ROUTING_KEY = 'SimpleRoutingKey';
+const QUEUE_NAME = process.env.STORY_BUILDER_QUEUE_NAME;
+const ROUTING_KEY = process.env.STORY_BUILDER_ROUTING_KEY;
 
 const amqp = {
   conn: null,
