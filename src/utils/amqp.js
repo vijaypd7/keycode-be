@@ -1,166 +1,75 @@
 const amqplib = require('amqplib');
-const _ = require('lodash');
-const callbackTimeout = require('callback-timeout');
-const logger = require('./logger');
+const logger = require('./logger'); // Assuming a logger is available
 
-const CONSUME_TIMEOUT_MS = 5000;
+const RABBIT_URL = process.env.RABBIT_URL || 'amqp://localhost';
+const EXCHANGE_NAME = process.env.EXCHANGE_NAME || 'my_exchange';
+const QUEUE_NAME = 'SimpleQueue';
+const ROUTING_KEY = 'SimpleRoutingKey';
 
 const amqp = {
   conn: null,
   ch: null,
-  queue: null,
-  worker: null,
 
+  // Initialize connection to RabbitMQ and create channel
   async init() {
     try {
-      this.conn = await amqplib.connect(process.env.RABBIT_URL);
+      this.conn = await amqplib.connect(RABBIT_URL);
       this.ch = await this.conn.createChannel();
 
+      // Assert the exchange and queue
       await this.setupExchangesAndQueues();
       await this.setupBindings();
 
-      this.conn.on('error', this.handleConnectionError.bind(this));
-      logger.info(`Connected to ${process.env.RABBIT_URL}`);
+      logger.info(`Connected to RabbitMQ at ${RABBIT_URL}`);
     } catch (error) {
       logger.error('Failed to initialize AMQP client', error);
       throw error;
     }
   },
 
+  // Setup the exchange and queue
   async setupExchangesAndQueues() {
-    const { EXCHANGE_NAME, DEAD_LETTER_EXCHANGE_NAME } = process.env;
-    const exchanges = [EXCHANGE_NAME, DEAD_LETTER_EXCHANGE_NAME];
-    const queues = ['MessageQueue.ProductSync'];
-
-    await Promise.all([
-      ...exchanges.map(ex => this.ch.assertExchange(ex, 'topic', { durable: true })),
-      ...queues.map(queue => this.ch.assertQueue(queue, {
-        durable: true,
-        deadLetterExchange: DEAD_LETTER_EXCHANGE_NAME,
-        maxPriority: 255,
-      }))
-    ]);
+    await this.ch.assertExchange(EXCHANGE_NAME, 'topic', { durable: true });
+    await this.ch.assertQueue(QUEUE_NAME, { durable: true });
   },
 
+  // Bind the queue to the exchange with a routing key
   async setupBindings() {
-    const queueRoutings = {
-      'MessageQueue.ProductSync': ['MessageRoutingKey.ProductSync'],
-    };
-
-    for (const [queue, routingKeys] of Object.entries(queueRoutings)) {
-      for (const routingKey of routingKeys) {
-        await this.ch.bindQueue(queue, process.env.EXCHANGE_NAME, routingKey);
-      }
-    }
+    await this.ch.bindQueue(QUEUE_NAME, EXCHANGE_NAME, ROUTING_KEY);
   },
 
-  async handleConnectionError(err) {
-    logger.error('AMQP connection error', err);
-    try {
-      await this.reconnect();
-    } catch (reconnectError) {
-      logger.error('Failed to reconnect', reconnectError);
-      process.exit(1);
-    }
-  },
-
-  async reconnect(delay = 5000) {
-    logger.error(`Connection to ${process.env.RABBIT_URL} closed. Reconnecting...`);
-    await new Promise(resolve => setTimeout(resolve, delay));
-
-    try {
-      await this.init();
-      if (this.queue && this.worker) {
-        await this.subscribeToQueue(this.queue, this.worker);
-      }
-    } catch (error) {
-      await this.reconnect(delay * 2);
-    }
-  },
-
-  async getConnection() {
-    if (!this.conn) {
-      await this.init();
-    }
-    return this.conn;
-  },
-
-  async getChannel() {
-    if (!this.ch) {
-      const conn = await this.getConnection();
-      this.ch = await conn.createChannel();
-    }
-    return this.ch;
-  },
-
-  async publishMessage(routingKey, params, priority = 0) {
-    const ch = await this.getChannel();
-    const msg = JSON.stringify(params);
-
-    await ch.publish(process.env.EXCHANGE_NAME, routingKey, Buffer.from(msg), {
-      priority,
+  // Publish a message to the exchange with a specific routing key
+  async publishMessage(routingKey, message, priority = 0) {
+    const msgBuffer = Buffer.from(JSON.stringify(message));
+    await this.ch.publish(EXCHANGE_NAME, routingKey, msgBuffer, {
       persistent: true,
+      priority: priority
     });
+    logger.info(`Message published to ${routingKey}: ${message}`);
   },
 
-  async subscribeToQueue(queue, worker) {
-    const ch = await this.getChannel();
-    this.queue = queue;
-    this.worker = worker;
-
-    logger.info(`Waiting on messages from ${queue}`);
-    ch.prefetch(1);
-
-    const consumeOptions = { noAck: false };
-    const messageHandler = process.env.SELF_TERMINATING === 'true'
-      ? this.createSelfTerminatingHandler(worker, ch)
-      : this.createStandardHandler(worker, ch);
-
-    ch.consume(queue, messageHandler, consumeOptions);
-  },
-
-  createSelfTerminatingHandler(worker, ch) {
-    return callbackTimeout(async (msg) => {
-      if (msg.code === 'ETIMEDOUT') {
-        await this.closeConnection();
-        logger.info('No messages enqueued. Terminating worker.');
-        process.exit(0);
-      } else {
-        await this.processMessage(worker, ch, msg);
-        await this.closeConnection();
-        logger.info('Finished processing message. Terminating worker.');
-        process.exit(0);
+  // Subscribe to a queue and process messages
+  async subscribeToQueue(queue, messageHandler) {
+    this.ch.prefetch(1);  // Process one message at a time
+    await this.ch.consume(queue, async (msg) => {
+      if (msg) {
+        const content = JSON.parse(msg.content.toString());
+        try {
+          await messageHandler(content); // Process the message
+          this.ch.ack(msg);  // Acknowledge message on success
+        } catch (error) {
+          logger.error('Error processing message:', error);
+          this.ch.nack(msg, false, false);  // Don't requeue message
+        }
       }
-    }, CONSUME_TIMEOUT_MS);
+    }, { noAck: false });
   },
 
-  createStandardHandler(worker, ch) {
-    return async (msg) => {
-      await this.processMessage(worker, ch, msg);
-    };
-  },
-
-  async processMessage(worker, ch, msg) {
-    logger.info('Received message:', JSON.stringify(_.omit(msg, 'content')));
-    const { content, properties } = msg;
-
-    try {
-      await worker.run(content, properties);
-      ch.ack(msg);
-      logger.info('Acking message');
-    } catch (error) {
-      this.handleProcessingError(error, ch, msg);
-    }
-  },
-
-  handleProcessingError(error, ch, msg) {
-    logger.error(`Error processing message: ${error.stack}`);
-    ch.nack(msg, false, false); // Don't requeue msg or it will enter an infinite loop
-  },
-
+  // Close the RabbitMQ connection and channel
   async closeConnection() {
     if (this.ch) await this.ch.close();
     if (this.conn) await this.conn.close();
+    logger.info('AMQP connection closed.');
   }
 };
 
