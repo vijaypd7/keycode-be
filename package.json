@@ -1,0 +1,24 @@
+{
+  "name": "keycode-backend",
+  "version": "1.0.0",
+  "main": "app.js",
+  "scripts": {
+    "start": "node ./src/app.js",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev:worker": "NODE_ENV=development node src/worker.js",
+    "dev:worker:feedVariationGenerationWorker": "npm run dev:worker -- -t=feedVariationGenerationWorker"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "amqplib": "^0.10.4",
+    "argparse": "^2.0.1",
+    "bluebird": "^3.7.2",
+    "callback-timeout": "^4.0.0",
+    "express": "4.21.0",
+    "lodash": "^4.17.21",
+    "pg": "^8.7.1",
+    "winston": "^3.14.2"
+  }
+}
